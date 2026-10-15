@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::agent::{Agent, ExecSpec, GuestOs, powershell};
 use crate::console::Consoles;
-use crate::hypervisor::Hypervisor;
+use crate::hypervisor::{self, Hypervisor};
 use crate::{display, fsops};
 
 /// Tools hidden in read-only mode.
@@ -28,6 +28,9 @@ const MUTATING_TOOLS: &[&str] = &[
     "screenshot",
     "send_keys",
     "type_text",
+    "start_vm",
+    "stop_vm",
+    "copy_to_vm",
 ];
 
 pub struct State {
@@ -139,6 +142,33 @@ pub struct PathParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct CopyToVmParams {
+    pub vm: String,
+    /// Absolute path of the file on the host. Must be inside one of the host share directories.
+    pub host_path: String,
+    /// Absolute destination path inside the guest. Parent directory must exist; an existing file is overwritten.
+    pub guest_path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StartVmParams {
+    pub vm: String,
+    /// After starting, wait up to this many seconds for the guest agent to respond (default 0, max 300).
+    #[serde(default)]
+    pub wait_for_agent_secs: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StopVmParams {
+    pub vm: String,
+    /// Power off immediately, like pulling the plug, instead of asking the guest to shut down.
+    #[serde(default)]
+    pub force: bool,
+    /// How long to wait for a graceful shutdown to finish (default 60, max 300).
+    pub wait_secs: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct ConsoleOpenParams {
     pub vm: String,
     /// Console device alias (e.g. "serial0", "console1"); omit for the first console.
@@ -208,10 +238,18 @@ pub struct TypeTextParams {
 impl VirtServer {
     pub fn new(state: Arc<State>) -> Self {
         let mut tool_router = Self::tool_router();
-        if state.hv.config.read_only {
+        let config = &state.hv.config;
+        if config.read_only {
             for name in MUTATING_TOOLS {
                 tool_router.remove_route(name);
             }
+        }
+        if config.power_vms.is_empty() {
+            tool_router.remove_route("start_vm");
+            tool_router.remove_route("stop_vm");
+        }
+        if config.host_share_dirs.is_empty() {
+            tool_router.remove_route("copy_to_vm");
         }
         Self { state, tool_router }
     }
@@ -229,29 +267,33 @@ impl VirtServer {
         }
     }
 
-    #[tool(description = "List running VMs this server may access, whether their QEMU guest agent responds, and the guest OS family.")]
+    #[tool(description = "List VMs this server may access: power state, whether start_vm/stop_vm may be used on them, \
+        and for running VMs whether the QEMU guest agent responds and the guest OS family.")]
     async fn list_vms(&self) -> Result<CallToolResult, ErrorData> {
         self.blocking(|s| {
             let timeout = s.hv.config.limits.agent_timeout_secs.min(3);
             let vms: Vec<Value> = s
                 .hv
-                .running_allowed()?
+                .allowed()?
                 .iter()
                 .map(|d| {
+                    let name = d.get_name().unwrap_or_default();
                     let agent = Agent::new(d, timeout);
-                    let ok = agent.ping();
+                    let ok = d.is_active().unwrap_or(false) && agent.ping();
                     json!({
-                        "name": d.get_name().unwrap_or_default(),
+                        "name": name,
+                        "state": hypervisor::state_name(d),
+                        "power_control": s.hv.config.can_power(&name) && !s.hv.config.read_only,
                         "guest_agent": ok,
                         "os": if ok { agent.os().ok() } else { None },
-                        "console_open": s.consoles_has(&d.get_name().unwrap_or_default()),
+                        "console_open": s.consoles_has(&name),
                     })
                 })
                 .collect();
             let mut out = vec![json_block(&vms)?];
             if vms.is_empty() {
                 out.push(ContentBlock::text(
-                    "No accessible running VMs. Check that the VM is running and listed in allowed_vms.",
+                    "No accessible VMs. Check that the VM exists and is listed in allowed_vms.",
                 ));
             }
             Ok(out)
@@ -346,6 +388,73 @@ impl VirtServer {
             };
             let n = s.agent(&dom).write_file(&p.path, &data, p.append)?;
             Ok(vec![ContentBlock::text(format!("wrote {n} bytes to {}", p.path))])
+        })
+        .await
+    }
+
+    #[tool(description = "Copy a file from the host into the guest via the QEMU guest agent. The file is streamed \
+        directly by the server, so it can be large and never passes through the conversation. Only files inside the \
+        configured host share directories can be copied.")]
+    async fn copy_to_vm(&self, Parameters(p): Parameters<CopyToVmParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let dom = s.hv.domain(&p.vm)?;
+            let src = s.hv.config.share_file(&p.host_path)?;
+            let file = std::fs::File::open(&src).with_context(|| format!("cannot open {}", src.display()))?;
+            let n = s.agent(&dom).write_from(&p.guest_path, std::io::BufReader::new(file), false)?;
+            Ok(vec![ContentBlock::text(format!("copied {n} bytes from {} to {}", src.display(), p.guest_path))])
+        })
+        .await
+    }
+
+    #[tool(description = "Start a VM that is shut off (or resume it if paused, wake it if suspended). \
+        Only VMs with power_control: true in list_vms can be started.")]
+    async fn start_vm(&self, Parameters(p): Parameters<StartVmParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let mut msg = format!("VM '{}': {}", p.vm, s.hv.start(&p.vm)?);
+            let wait = Duration::from_secs(p.wait_for_agent_secs.min(300));
+            if !wait.is_zero() {
+                let dom = s.hv.domain(&p.vm)?;
+                let agent = Agent::new(&dom, 2);
+                let start = std::time::Instant::now();
+                let ready = loop {
+                    if agent.ping() {
+                        break true;
+                    }
+                    if start.elapsed() >= wait {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                };
+                msg.push_str(if ready {
+                    "; guest agent is responding"
+                } else {
+                    "; guest agent not responding yet (the guest may still be booting)"
+                });
+            }
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "Shut down a VM. By default asks the guest to shut down cleanly (ACPI power button or guest \
+        agent) and waits for it; with force: true it is powered off immediately, which can lose unsaved data. \
+        Only VMs with power_control: true in list_vms can be stopped.")]
+    async fn stop_vm(&self, Parameters(p): Parameters<StopVmParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let wait = Duration::from_secs(p.wait_secs.unwrap_or(60).min(300));
+            let off = s.hv.stop(&p.vm, p.force, wait)?;
+            let msg = if off {
+                s.consoles.close(&p.vm);
+                format!("VM '{}' is shut off", p.vm)
+            } else {
+                format!(
+                    "VM '{}' is still running after {}s; the guest may be ignoring the shutdown request. \
+                     Wait longer or call stop_vm again with force: true.",
+                    p.vm,
+                    wait.as_secs()
+                )
+            };
+            Ok(vec![ContentBlock::text(msg)])
         })
         .await
     }
@@ -465,18 +574,33 @@ impl VirtServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for VirtServer {
     fn get_info(&self) -> ServerConfig {
-        let mode = if self.state.hv.config.read_only {
-            " The server is in READ-ONLY mode: only listing VMs, reading files/directories and reading the serial console are available."
+        let config = &self.state.hv.config;
+        let mut extra = String::new();
+        if config.read_only {
+            extra.push_str(
+                " The server is in READ-ONLY mode: only listing VMs, reading files/directories and reading the serial console are available.",
+            );
         } else {
-            ""
-        };
+            if config.power_vms.is_empty() {
+                extra.push_str(" This server cannot start or stop VMs.");
+            } else {
+                extra.push_str(" start_vm/stop_vm can power VMs on and off where list_vms shows power_control: true.");
+            }
+            if !config.host_share_dirs.is_empty() {
+                let dirs: Vec<String> = config.host_share_dirs.iter().map(|d| d.display().to_string()).collect();
+                extra.push_str(&format!(
+                    " copy_to_vm can copy host files from these directories into a guest: {}.",
+                    dirs.join(", ")
+                ));
+            }
+        }
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "Access to already-running libvirt/virt-manager VMs (Linux and Windows guests). Start with list_vms. \
+                "Access to libvirt/virt-manager VMs (Linux and Windows guests). Start with list_vms. \
                  exec, file and info tools need the QEMU guest agent running in the guest. console_* tools use the \
                  serial console; screenshot/send_keys/type_text use the graphical display. This server cannot \
-                 start, stop or reconfigure VMs.{mode}"
+                 create or reconfigure VMs.{extra}"
             ))
     }
 }

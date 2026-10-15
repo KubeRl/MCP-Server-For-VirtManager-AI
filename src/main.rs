@@ -53,6 +53,12 @@ struct Cli {
     /// Additional VM to allow (repeatable), added to allowed_vms from the config file.
     #[arg(long = "allow", value_name = "VM")]
     allow: Vec<String>,
+    /// Additional VM the AI may start and stop (repeatable), added to power_vms.
+    #[arg(long = "allow-power", value_name = "VM")]
+    allow_power: Vec<String>,
+    /// Additional host directory copy_to_vm may read from (repeatable), added to host_share_dirs.
+    #[arg(long = "share", value_name = "DIR")]
+    share: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -85,6 +91,8 @@ async fn main() -> Result<()> {
     }
     config.read_only |= cli.read_only;
     config.allowed_vms.extend(cli.allow);
+    config.power_vms.extend(cli.allow_power);
+    config.host_share_dirs.extend(cli.share);
     config.validate()?;
 
     if config.allowed_vms.is_empty() {
@@ -97,6 +105,8 @@ async fn main() -> Result<()> {
         uri = %config.uri,
         read_only = config.read_only,
         allowed = ?config.allowed_vms,
+        power = ?config.power_vms,
+        shares = ?config.host_share_dirs,
         "connected to libvirt"
     );
     let state = Arc::new(State {

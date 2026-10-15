@@ -1,8 +1,9 @@
 # virtmanager-mcp
 
-An MCP server that gives an AI access to **already running** libvirt / virt-manager VMs:
-command execution, file access, the serial console, screenshots and keyboard input.
-It deliberately cannot start, stop, create or reconfigure VMs.
+An MCP server that gives an AI access to libvirt / virt-manager VMs:
+command execution, file access, copying host files into guests, the serial console, screenshots
+and keyboard input. VMs you opt in can also be started and stopped. It cannot create or
+reconfigure VMs.
 
 Host: Linux. Guests: Linux and Windows.
 
@@ -10,9 +11,10 @@ Host: Linux. Guests: Linux and Windows.
 
 | Capability | Mechanism | Guest requirement |
 |---|---|---|
-| `exec`, `read_file`, `write_file`, `list_dir`, `stat_path`, `guest_info` | QEMU guest agent over a virtio-serial channel (`virDomainQemuAgentCommand`) | qemu-guest-agent running |
+| `exec`, `read_file`, `write_file`, `copy_to_vm`, `list_dir`, `stat_path`, `guest_info` | QEMU guest agent over a virtio-serial channel (`virDomainQemuAgentCommand`) | qemu-guest-agent running |
 | `console_open/read/write/close` | Serial / virtio console stream (`virDomainOpenConsole`, like `virsh console`) | `<console>`/`<serial>` device + getty on it |
 | `screenshot`, `send_keys`, `type_text` | Graphical display (`virDomainScreenshot`, `virDomainSendKey`) | A graphics device (SPICE/VNC) |
+| `start_vm`, `stop_vm` | libvirt (`virDomainCreate`, `virDomainShutdown`, `virDomainDestroy`) | none (graceful stop needs ACPI or the guest agent) |
 
 `list_dir` and `stat_path` run fixed helper commands through `guest-exec`
 (`stat`/`find` on Linux, PowerShell on Windows), because qemu-ga has no directory listing.
@@ -22,17 +24,20 @@ The path is passed as data, never spliced into shell code.
 
 | Tool | Read-only mode |
 |---|---|
-| `list_vms`: running, allowed VMs, agent status, OS family | ✅ |
+| `list_vms`: allowed VMs, power state, agent status, OS family | ✅ |
 | `read_file`, `list_dir`, `stat_path` | ✅ |
 | `console_open`, `console_read`, `console_close` | ✅ |
 | `exec`: shell command (`sh`/`bash`/`cmd`/`powershell`) or program + args, with timeout | ❌ |
 | `write_file` (overwrite/append, text or base64) | ❌ |
+| `copy_to_vm`: copy a host file into the guest (only with `host_share_dirs`) | ❌ |
+| `start_vm`, `stop_vm` (graceful or `force`) (only for VMs in `power_vms`) | ❌ |
 | `console_write` | ❌ |
 | `guest_info`: OS, hostname, NICs, filesystems, users, timezone | ❌ |
 | `screenshot` (PNG, downscaled to 1280 px wide by default) | ❌ |
 | `send_keys` (`ctrl+alt+delete`, `win+r`, …), `type_text` (US layout) | ❌ |
 
-In read-only mode the ❌ tools are not advertised at all.
+In read-only mode the ❌ tools are not advertised at all. `start_vm`/`stop_vm` are also hidden while
+`power_vms` is empty, and `copy_to_vm` while `host_share_dirs` is empty.
 
 ## Build
 
@@ -52,8 +57,10 @@ cargo build --release
    ```
 2. Configuration: copy `config.example.toml` to `~/.config/virtmanager-mcp/config.toml` and list
    your VMs in `allowed_vms`. **No VM is accessible until it is listed** (or `"*"` is used).
-   CLI flags override the file: `--uri`, `--allow <VM>` (repeatable), `--read-only`,
-   `--bind`, `--config`.
+   CLI flags override the file: `--uri`, `--allow <VM>` (repeatable), `--allow-power <VM>`
+   (repeatable), `--share <DIR>` (repeatable), `--read-only`, `--bind`, `--config`.
+3. Optional: list VMs the AI may start and stop in `power_vms` (they must also be in `allowed_vms`),
+   and host directories it may copy files from in `host_share_dirs`.
 
 ## Guest setup
 
@@ -137,5 +144,11 @@ HTTP mode refuses to start without a token. Requests without a matching `Authori
 - `console_read` returns output received since `console_open`. Earlier output (e.g. boot logs) is
   not available. Only one client can hold a console: if virt-manager's serial console view
   is open, `console_open` fails unless `force: true`, which disconnects the other client.
+- `copy_to_vm` streams the file in 64 KiB guest-agent requests, so the data never passes through
+  the conversation. The host path is resolved (symlinks, `..`) before the `host_share_dirs`
+  check, so links pointing outside a share are refused. The guest file gets the guest agent's
+  default permissions; run `chmod +x` through `exec` for scripts. The parent directory must exist.
+- `stop_vm` without `force` sends a shutdown request and waits (60 s by default). A guest that
+  ignores ACPI and has no guest agent will not shut down; use `force: true` to power it off.
 - `type_text` assumes a US keyboard layout in the guest and supports printable ASCII only.
 - Logs go to stderr; set verbosity with `RUST_LOG` (e.g. `RUST_LOG=debug`).

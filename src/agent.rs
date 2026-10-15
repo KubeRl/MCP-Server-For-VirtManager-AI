@@ -2,6 +2,7 @@
 //!
 //! All functions here block; call them from `spawn_blocking`.
 
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,8 +12,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use virt::domain::Domain;
 
-/// Max bytes per guest-file-read / guest-file-write request.
+/// Max bytes per guest-file-read request.
 const FILE_CHUNK: usize = 1024 * 1024;
+/// Max bytes per guest-file-write request. Larger writes (256 KiB and up) were seen to
+/// hang qemu-ga past the agent timeout, while 64 KiB copies several MB/s.
+const WRITE_CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -182,19 +186,30 @@ impl<'a> Agent<'a> {
         result
     }
 
-    pub fn write_file(&self, path: &str, data: &[u8], append: bool) -> Result<usize> {
+    pub fn write_file(&self, path: &str, data: &[u8], append: bool) -> Result<u64> {
+        self.write_from(path, data, append)
+    }
+
+    /// Streams `src` into a guest file in `WRITE_CHUNK` pieces. Returns the number of bytes written.
+    pub fn write_from(&self, path: &str, mut src: impl Read, append: bool) -> Result<u64> {
         let handle = self.open(path, if append { "ab" } else { "wb" })?;
         let result = (|| {
-            let mut written = 0;
-            for chunk in data.chunks(FILE_CHUNK) {
+            let mut written = 0u64;
+            let mut buf = Vec::with_capacity(WRITE_CHUNK);
+            loop {
+                buf.clear();
+                (&mut src).take(WRITE_CHUNK as u64).read_to_end(&mut buf)?;
+                if buf.is_empty() {
+                    break;
+                }
                 let r = self.call(
                     "guest-file-write",
-                    Some(json!({ "handle": handle, "buf-b64": B64.encode(chunk) })),
+                    Some(json!({ "handle": handle, "buf-b64": B64.encode(&buf) })),
                 )?;
-                let n = r.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let n = r.get("count").and_then(Value::as_u64).unwrap_or(0);
                 written += n;
-                if n != chunk.len() {
-                    bail!("short write: {written} of {} bytes written", data.len());
+                if n != buf.len() as u64 {
+                    bail!("short write: only {written} bytes written");
                 }
             }
             self.call("guest-file-flush", Some(json!({ "handle": handle })))?;

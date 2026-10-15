@@ -7,6 +7,14 @@ uri = "qemu:///system"
 # An empty list means no VM is accessible.
 allowed_vms = ["fedora-test", "win11"]
 
+# VMs the AI may start and stop (must also be in allowed_vms). "*" = every allowed VM.
+# Empty (the default) hides start_vm/stop_vm.
+power_vms = ["fedora-test"]
+
+# Host directories the AI may copy files from into a guest with copy_to_vm.
+# Empty (the default) hides copy_to_vm.
+# host_share_dirs = ["/home/me/vm-share"]
+
 # When true, only list_vms, read_file, list_dir, stat_path and the console_open/
 # console_read/console_close tools are exposed.
 read_only = false
