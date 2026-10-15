@@ -19,6 +19,9 @@ pub struct Config {
     /// Host directories whose files `copy_to_vm` may copy into a guest.
     /// Empty by default, which disables the tool.
     pub host_share_dirs: Vec<PathBuf>,
+    /// Also lets `copy_to_vm` read from the directory the server was started in.
+    /// Claude Code starts stdio servers in the session's project directory.
+    pub share_project_dir: bool,
     /// Disables command execution, file writes, console input, keyboard input,
     /// screenshots and guest info queries.
     pub read_only: bool,
@@ -58,6 +61,7 @@ impl Default for Config {
             allowed_vms: Vec::new(),
             power_vms: Vec::new(),
             host_share_dirs: Vec::new(),
+            share_project_dir: false,
             read_only: false,
             limits: Limits::default(),
             http: Http::default(),
@@ -107,7 +111,8 @@ impl Config {
         }
     }
 
-    /// Checks limits and resolves `host_share_dirs` to canonical paths.
+    /// Checks limits, resolves `host_share_dirs` to canonical paths and, with
+    /// `share_project_dir`, adds the working directory to them.
     pub fn validate(&mut self) -> Result<()> {
         if self.limits.agent_timeout_secs <= 0 {
             bail!("limits.agent_timeout_secs must be positive");
@@ -123,6 +128,14 @@ impl Config {
                 bail!("host_share_dirs: {} is not a directory", dir.display());
             }
             *dir = real;
+        }
+        if self.share_project_dir {
+            let cwd = std::env::current_dir()?.canonicalize()?;
+            let home = std::env::var_os("HOME").and_then(|h| PathBuf::from(h).canonicalize().ok());
+            match project_dir(cwd, home.as_deref()) {
+                Ok(dir) => self.host_share_dirs.push(dir),
+                Err(e) => tracing::warn!("share_project_dir: {e:#}"),
+            }
         }
         Ok(())
     }
@@ -153,6 +166,14 @@ impl Config {
     }
 }
 
+/// Accepts `cwd` as a project directory unless sharing it would expose too much.
+fn project_dir(cwd: PathBuf, home: Option<&Path>) -> Result<PathBuf> {
+    if cwd.parent().is_none() || home.is_some_and(|h| h.starts_with(&cwd)) {
+        bail!("not sharing {}: it is the root or home directory, not a project", cwd.display());
+    }
+    Ok(cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +197,14 @@ mod tests {
         assert!(config.share_file(&s(&share.join("sub"))).is_err());
         assert!(config.share_file("sub/ok.txt").is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn project_dir_refuses_root_and_home() {
+        let home = Path::new("/home/u");
+        assert!(project_dir("/home/u/code/app".into(), Some(home)).is_ok());
+        assert!(project_dir("/home/u".into(), Some(home)).is_err());
+        assert!(project_dir("/home".into(), Some(home)).is_err());
+        assert!(project_dir("/".into(), Some(home)).is_err());
     }
 }

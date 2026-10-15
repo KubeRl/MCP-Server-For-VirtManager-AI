@@ -37,7 +37,7 @@ The path is passed as data, never spliced into shell code.
 | `send_keys` (`ctrl+alt+delete`, `win+r`, …), `type_text` (US layout) | ❌ |
 
 In read-only mode the ❌ tools are not advertised at all. `start_vm`/`stop_vm` are also hidden while
-`power_vms` is empty, and `copy_to_vm` while `host_share_dirs` is empty.
+`power_vms` is empty, and `copy_to_vm` while no host directory is shared (`host_share_dirs` / `share_project_dir`).
 
 ## Build
 
@@ -58,9 +58,14 @@ cargo build --release
 2. Configuration: copy `config.example.toml` to `~/.config/virtmanager-mcp/config.toml` and list
    your VMs in `allowed_vms`. **No VM is accessible until it is listed** (or `"*"` is used).
    CLI flags override the file: `--uri`, `--allow <VM>` (repeatable), `--allow-power <VM>`
-   (repeatable), `--share <DIR>` (repeatable), `--read-only`, `--bind`, `--config`.
+   (repeatable), `--share <DIR>` (repeatable), `--share-project-dir`, `--read-only`, `--bind`,
+   `--config`.
 3. Optional: list VMs the AI may start and stop in `power_vms` (they must also be in `allowed_vms`),
-   and host directories it may copy files from in `host_share_dirs`.
+   and host directories it may copy files from in `host_share_dirs`. To allow copying only from the
+   project you're working in, set `share_project_dir = true` instead: Claude Code starts the
+   server in the session's project directory, and that directory becomes the only share. It is
+   ignored when that directory is `/` or your home directory. In HTTP mode there's one shared
+   server, so the "project" is wherever you started it.
 
 ## Guest setup
 

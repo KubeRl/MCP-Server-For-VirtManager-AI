@@ -144,7 +144,7 @@ pub struct PathParams {
 #[derive(Deserialize, JsonSchema)]
 pub struct CopyToVmParams {
     pub vm: String,
-    /// Absolute path of the file on the host. Must be inside one of the host share directories.
+    /// Absolute path of the file on the host. Must be inside one of the directories listed in the server instructions.
     pub host_path: String,
     /// Absolute destination path inside the guest. Parent directory must exist; an existing file is overwritten.
     pub guest_path: String,
@@ -394,7 +394,7 @@ impl VirtServer {
 
     #[tool(description = "Copy a file from the host into the guest via the QEMU guest agent. The file is streamed \
         directly by the server, so it can be large and never passes through the conversation. Only files inside the \
-        configured host share directories can be copied.")]
+        shared host directories (named in the server instructions) can be copied.")]
     async fn copy_to_vm(&self, Parameters(p): Parameters<CopyToVmParams>) -> Result<CallToolResult, ErrorData> {
         self.blocking(move |s| {
             let dom = s.hv.domain(&p.vm)?;

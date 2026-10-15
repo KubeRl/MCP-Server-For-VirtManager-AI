@@ -15,6 +15,11 @@ power_vms = ["fedora-test"]
 # Empty (the default) hides copy_to_vm.
 # host_share_dirs = ["/home/me/vm-share"]
 
+# Also share the directory the server is started in. Claude Code starts the server in the
+# session's project directory, so this limits copying to the current project. Ignored when
+# that directory is / or your home directory.
+share_project_dir = false
+
 # When true, only list_vms, read_file, list_dir, stat_path and the console_open/
 # console_read/console_close tools are exposed.
 read_only = false

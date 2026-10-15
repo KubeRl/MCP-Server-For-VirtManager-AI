@@ -59,6 +59,9 @@ struct Cli {
     /// Additional host directory copy_to_vm may read from (repeatable), added to host_share_dirs.
     #[arg(long = "share", value_name = "DIR")]
     share: Vec<PathBuf>,
+    /// Let copy_to_vm read from the directory the server was started in (the project directory).
+    #[arg(long)]
+    share_project_dir: bool,
 }
 
 #[tokio::main]
@@ -93,6 +96,7 @@ async fn main() -> Result<()> {
     config.allowed_vms.extend(cli.allow);
     config.power_vms.extend(cli.allow_power);
     config.host_share_dirs.extend(cli.share);
+    config.share_project_dir |= cli.share_project_dir;
     config.validate()?;
 
     if config.allowed_vms.is_empty() {
