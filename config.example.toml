@@ -1,0 +1,24 @@
+# Copy to ~/.config/virtmanager-mcp/config.toml
+
+# libvirt URI. qemu:///system is what virt-manager uses by default.
+uri = "qemu:///system"
+
+# VMs the AI may access (names as shown in virt-manager). "*" allows all.
+# An empty list means no VM is accessible.
+allowed_vms = ["fedora-test", "win11"]
+
+# When true, only list_vms, read_file, list_dir, stat_path and the console_open/
+# console_read/console_close tools are exposed.
+read_only = false
+
+[limits]
+exec_timeout_secs = 60              # default per-call exec timeout
+max_output_bytes = 1048576          # stdout/stderr cap per exec call
+max_file_read_bytes = 10485760      # read_file cap
+agent_timeout_secs = 10             # single guest agent request
+console_buffer_bytes = 262144       # serial console scrollback per VM
+
+[http]
+bind = "127.0.0.1:8765"
+# Required for --transport http. Can also be set via VIRTMANAGER_MCP_TOKEN.
+# token = "change-me"
