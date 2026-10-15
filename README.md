@@ -1,3 +1,5 @@
+The commits are the only non-vibecoded part of this project, and also this line. Rust is hard man. And I'm too lazy to learn.
+
 # virtmanager-mcp
 
 An MCP server that gives an AI access to libvirt / virt-manager VMs:
