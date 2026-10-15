@@ -50,6 +50,7 @@ Requires the libvirt development files (`libvirt` on Arch, `libvirt-dev` on Debi
 cargo build --release
 # binary: target/release/virtmanager-mcp
 ```
+Obviously, you don't have to build it if you download the release file.
 
 ## Host setup
 
