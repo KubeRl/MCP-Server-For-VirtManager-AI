@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, ExecSpec, GuestOs, powershell};
 use crate::console::Consoles;
 use crate::hypervisor::{self, Hypervisor};
-use crate::{display, fsops};
+use crate::{display, fsops, manage};
 
 /// Tools hidden in read-only mode.
 const MUTATING_TOOLS: &[&str] = &[
@@ -32,6 +32,12 @@ const MUTATING_TOOLS: &[&str] = &[
     "stop_vm",
     "copy_to_vm",
 ];
+
+/// Tools behind [manage] create / delete / reconfigure / snapshots.
+const CREATE_TOOLS: &[&str] = &["create_vm"];
+const DELETE_TOOLS: &[&str] = &["delete_vm"];
+const RECONFIGURE_TOOLS: &[&str] = &["configure_vm", "attach_disk", "detach_disk", "set_cdrom", "attach_nic", "detach_nic"];
+const SNAPSHOT_TOOLS: &[&str] = &["snapshot_create", "snapshot_list", "snapshot_revert", "snapshot_delete"];
 
 pub struct State {
     pub hv: Hypervisor,
@@ -232,6 +238,107 @@ pub struct TypeTextParams {
     pub delay_ms: Option<u64>,
 }
 
+#[derive(Deserialize, JsonSchema, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OsKind {
+    Linux,
+    /// Adds Hyper-V enlightenments and a local-time clock.
+    Windows,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Firmware {
+    #[default]
+    Uefi,
+    Bios,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateVmParams {
+    /// Name of the new VM: 1-64 characters of A-Z, a-z, 0-9, '.', '_', '-'.
+    pub name: String,
+    pub os: OsKind,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    /// Size of the system disk (a new qcow2 volume in the disk pool).
+    pub disk_gib: u64,
+    /// Default uefi.
+    #[serde(default)]
+    pub firmware: Firmware,
+    /// Add an emulated TPM 2.0 (needed by Windows 11).
+    #[serde(default)]
+    pub tpm: bool,
+    /// Install ISO (absolute host path from list_isos), attached as a bootable CD-ROM.
+    pub iso: Option<String>,
+    /// Second ISO attached as another CD-ROM, e.g. virtio-win.iso so a Windows installer can load
+    /// the virtio disk and network drivers.
+    pub driver_iso: Option<String>,
+    /// libvirt network to connect to (default: the first allowed network; none if no network is allowed).
+    pub network: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ConfigureVmParams {
+    pub vm: String,
+    /// New number of vCPUs (takes effect at next boot).
+    pub vcpus: Option<u32>,
+    /// New memory size in MiB (takes effect at next boot).
+    pub memory_mib: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AttachDiskParams {
+    pub vm: String,
+    /// Size of the new disk.
+    pub size_gib: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DetachDiskParams {
+    pub vm: String,
+    /// Disk target as shown by describe_vm, e.g. "vdb".
+    pub target: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SetCdromParams {
+    pub vm: String,
+    /// Absolute host path of an ISO (from list_isos). Omit to eject.
+    pub iso: Option<String>,
+    /// CD-ROM target as shown by describe_vm, e.g. "sda". Omit for the first CD-ROM drive.
+    pub target: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AttachNicParams {
+    pub vm: String,
+    /// libvirt network name (one of the allowed networks).
+    pub network: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DetachNicParams {
+    pub vm: String,
+    /// MAC address of the interface, as shown by describe_vm.
+    pub mac: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SnapshotParams {
+    pub vm: String,
+    /// Snapshot name.
+    pub snapshot: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SnapshotCreateParams {
+    pub vm: String,
+    /// Snapshot name: 1-64 characters of A-Z, a-z, 0-9, '.', '_', '-'.
+    pub snapshot: String,
+    pub description: Option<String>,
+}
+
 // ---- tools --------------------------------------------------------------------
 
 #[tool_router]
@@ -244,12 +351,27 @@ impl VirtServer {
                 tool_router.remove_route(name);
             }
         }
-        if config.power_vms.is_empty() {
+        // VMs created by this server can be powered on and off even when power_vms is empty.
+        if config.power_vms.is_empty() && !config.manage.enabled() {
             tool_router.remove_route("start_vm");
             tool_router.remove_route("stop_vm");
         }
         if config.host_share_dirs.is_empty() {
             tool_router.remove_route("copy_to_vm");
+        }
+        let m = &config.manage;
+        let off = |on: bool, tools: &'static [&'static str]| if on && !config.read_only { &[][..] } else { tools };
+        for name in [
+            off(m.create, CREATE_TOOLS),
+            off(m.delete, DELETE_TOOLS),
+            off(m.reconfigure, RECONFIGURE_TOOLS),
+            off(m.snapshots, SNAPSHOT_TOOLS),
+            off(m.enabled(), &["describe_vm"]),
+            off((m.create || m.reconfigure) && !m.iso_dirs.is_empty(), &["list_isos"]),
+        ]
+        .concat()
+        {
+            tool_router.remove_route(name);
         }
         Self { state, tool_router }
     }
@@ -268,7 +390,7 @@ impl VirtServer {
     }
 
     #[tool(description = "List VMs this server may access: power state, whether start_vm/stop_vm may be used on them, \
-        and for running VMs whether the QEMU guest agent responds and the guest OS family.")]
+        whether the VM management tools may act on them (managed), and for running VMs whether the QEMU guest agent responds and the guest OS family.")]
     async fn list_vms(&self) -> Result<CallToolResult, ErrorData> {
         self.blocking(|s| {
             let timeout = s.hv.config.limits.agent_timeout_secs.min(3);
@@ -283,7 +405,8 @@ impl VirtServer {
                     json!({
                         "name": name,
                         "state": hypervisor::state_name(d),
-                        "power_control": s.hv.config.can_power(&name) && !s.hv.config.read_only,
+                        "power_control": s.hv.can_power(d) && !s.hv.config.read_only,
+                        "managed": s.hv.can_manage(d) && !s.hv.config.read_only,
                         "guest_agent": ok,
                         "os": if ok { agent.os().ok() } else { None },
                         "console_open": s.consoles_has(&name),
@@ -569,6 +692,127 @@ impl VirtServer {
         })
         .await
     }
+
+    #[tool(description = "Create a new VM (shut off; start it with start_vm). It gets a new qcow2 system disk, an empty \
+        or ISO-loaded SATA CD-ROM it boots from after the disk, a virtio NIC, the QEMU guest agent channel, a serial \
+        console and a SPICE display. The guest agent must still be installed inside the guest. Limits and allowed \
+        networks are named in the server instructions.")]
+    async fn create_vm(&self, Parameters(p): Parameters<CreateVmParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let msg = manage::create(
+                &s.hv,
+                manage::NewVm {
+                    name: p.name,
+                    windows: p.os == OsKind::Windows,
+                    vcpus: p.vcpus,
+                    memory_mib: p.memory_mib,
+                    disk_gib: p.disk_gib,
+                    uefi: p.firmware == Firmware::Uefi,
+                    tpm: p.tpm,
+                    iso: p.iso,
+                    driver_iso: p.driver_iso,
+                    network: p.network,
+                },
+            )?;
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "Delete a shut-off VM with managed: true in list_vms, including its snapshots, NVRAM and TPM \
+        state. Its disks in the server's disk pool are deleted; other disks and ISOs are left in place. Cannot be undone.")]
+    async fn delete_vm(&self, Parameters(p): Parameters<VmParam>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let msg = manage::delete(&s.hv, &p.vm)?;
+            s.consoles.close(&p.vm);
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "Show the configuration of a VM with managed: true in list_vms: vCPUs, memory, firmware, TPM, \
+        disks and CD-ROMs (with targets), and network interfaces (with MACs).")]
+    async fn describe_vm(&self, Parameters(p): Parameters<VmParam>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![json_block(&manage::describe(&s.hv, &p.vm)?)?])).await
+    }
+
+    #[tool(description = "Change the vCPU count and/or memory of a managed VM. Changes the persistent configuration, \
+        so a running VM picks them up after it is shut down and started again.")]
+    async fn configure_vm(&self, Parameters(p): Parameters<ConfigureVmParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            Ok(vec![ContentBlock::text(manage::set_resources(&s.hv, &p.vm, p.vcpus, p.memory_mib)?)])
+        })
+        .await
+    }
+
+    #[tool(description = "Create a new empty qcow2 disk in the server's disk pool and attach it to a managed VM as the \
+        next free virtio disk (vdb, vdc, ...). Also works while the VM is running.")]
+    async fn attach_disk(&self, Parameters(p): Parameters<AttachDiskParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![ContentBlock::text(manage::attach_disk(&s.hv, &p.vm, p.size_gib)?)])).await
+    }
+
+    #[tool(description = "Detach a disk from a shut-off managed VM and DELETE its volume if it is in the server's disk \
+        pool (disks elsewhere are only detached). Use describe_vm to find the target.")]
+    async fn detach_disk(&self, Parameters(p): Parameters<DetachDiskParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![ContentBlock::text(manage::detach_disk(&s.hv, &p.vm, &p.target)?)])).await
+    }
+
+    #[tool(description = "Insert an ISO (from list_isos) into a managed VM's CD-ROM drive, or eject it by omitting iso. \
+        Works while the VM is running. A shut-off VM without a CD-ROM drive gets one added.")]
+    async fn set_cdrom(&self, Parameters(p): Parameters<SetCdromParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let msg = manage::set_cdrom(&s.hv, &p.vm, p.target.as_deref(), p.iso.as_deref())?;
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "Add a virtio network interface on an allowed libvirt network to a managed VM (also live).")]
+    async fn attach_nic(&self, Parameters(p): Parameters<AttachNicParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![ContentBlock::text(manage::attach_nic(&s.hv, &p.vm, &p.network)?)])).await
+    }
+
+    #[tool(description = "Remove a network interface, identified by MAC address (see describe_vm), from a managed VM.")]
+    async fn detach_nic(&self, Parameters(p): Parameters<DetachNicParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![ContentBlock::text(manage::detach_nic(&s.hv, &p.vm, &p.mac)?)])).await
+    }
+
+    #[tool(description = "List the ISO images on the host that create_vm and set_cdrom may use.")]
+    async fn list_isos(&self) -> Result<CallToolResult, ErrorData> {
+        self.blocking(|s| Ok(vec![json_block(&manage::list_isos(&s.hv.config.manage))?])).await
+    }
+
+    #[tool(description = "Create a snapshot of a managed VM. For a running VM it includes the memory state, so \
+        reverting resumes exactly where it was.")]
+    async fn snapshot_create(&self, Parameters(p): Parameters<SnapshotCreateParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let msg = manage::snapshot_create(&s.hv, &p.vm, &p.snapshot, p.description.as_deref())?;
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "List the snapshots of a managed VM, oldest first.")]
+    async fn snapshot_list(&self, Parameters(p): Parameters<VmParam>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![json_block(&manage::snapshot_list(&s.hv, &p.vm)?)?])).await
+    }
+
+    #[tool(description = "Revert a managed VM to a snapshot. Changes made since the snapshot are lost.")]
+    async fn snapshot_revert(&self, Parameters(p): Parameters<SnapshotParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| {
+            let msg = manage::snapshot_revert(&s.hv, &p.vm, &p.snapshot)?;
+            if !s.hv.lookup(&p.vm)?.is_active()? {
+                s.consoles.close(&p.vm);
+            }
+            Ok(vec![ContentBlock::text(msg)])
+        })
+        .await
+    }
+
+    #[tool(description = "Delete a snapshot of a managed VM. The VM itself is not changed.")]
+    async fn snapshot_delete(&self, Parameters(p): Parameters<SnapshotParams>) -> Result<CallToolResult, ErrorData> {
+        self.blocking(move |s| Ok(vec![ContentBlock::text(manage::snapshot_delete(&s.hv, &p.vm, &p.snapshot)?)])).await
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -581,7 +825,7 @@ impl ServerHandler for VirtServer {
                 " The server is in READ-ONLY mode: only listing VMs, reading files/directories and reading the serial console are available.",
             );
         } else {
-            if config.power_vms.is_empty() {
+            if config.power_vms.is_empty() && !config.manage.enabled() {
                 extra.push_str(" This server cannot start or stop VMs.");
             } else {
                 extra.push_str(" start_vm/stop_vm can power VMs on and off where list_vms shows power_control: true.");
@@ -593,14 +837,14 @@ impl ServerHandler for VirtServer {
                     dirs.join(", ")
                 ));
             }
+            extra.push_str(&manage_instructions(&config.manage));
         }
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
                 "Access to libvirt/virt-manager VMs (Linux and Windows guests). Start with list_vms. \
                  exec, file and info tools need the QEMU guest agent running in the guest. console_* tools use the \
-                 serial console; screenshot/send_keys/type_text use the graphical display. This server cannot \
-                 create or reconfigure VMs.{extra}"
+                 serial console; screenshot/send_keys/type_text use the graphical display.{extra}"
             ))
     }
 }
@@ -613,6 +857,41 @@ impl State {
     fn consoles_has(&self, vm: &str) -> bool {
         self.consoles.is_open(vm)
     }
+}
+
+fn manage_instructions(m: &crate::config::Manage) -> String {
+    if !m.enabled() {
+        return " This server cannot create, delete or reconfigure VMs.".into();
+    }
+    let mut ops = Vec::new();
+    for (on, op) in [(m.create, "create"), (m.delete, "delete"), (m.reconfigure, "reconfigure"), (m.snapshots, "snapshot")] {
+        if on {
+            ops.push(op);
+        }
+    }
+    let mut out = format!(
+        " VM management: this server may {} VMs. Management tools act on VMs with managed: true in list_vms (VMs \
+         this server created, which are also accessible and power-controllable, plus VMs the user listed). \
+         Limits per VM: {} vCPUs, {} MiB memory, {} GiB per disk; at most {} VMs created by this server at once.",
+        ops.join(", "),
+        m.max_vcpus,
+        m.max_memory_mib,
+        m.max_disk_gib,
+        m.max_vms,
+    );
+    if m.create || m.reconfigure {
+        if m.networks.is_empty() {
+            out.push_str(" No libvirt network is allowed, so VMs cannot get network interfaces.");
+        } else {
+            out.push_str(&format!(" Allowed networks: {}.", m.networks.join(", ")));
+        }
+        if m.iso_dirs.is_empty() {
+            out.push_str(" No ISO directory is configured.");
+        } else {
+            out.push_str(" Use list_isos to find install/driver ISOs.");
+        }
+    }
+    out
 }
 
 fn shell_spec(os: GuestOs, shell: Shell, cmd: &str) -> Result<ExecSpec> {

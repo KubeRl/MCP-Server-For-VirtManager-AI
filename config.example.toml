@@ -24,6 +24,28 @@ share_project_dir = false
 # console_read/console_close tools are exposed.
 read_only = false
 
+# VM management. Everything here is off by default; each operation is enabled separately.
+# Management tools act on VMs this server created (marked in their libvirt metadata) and on
+# VMs listed in manage_vms. VMs this server created are also treated as if they were in
+# allowed_vms and power_vms while any operation below is enabled. read_only hides it all.
+[manage]
+create = false        # create_vm
+delete = false        # delete_vm (deletes the VM's disks that are in disk_pool)
+reconfigure = false   # configure_vm, attach_disk, detach_disk, set_cdrom, attach_nic, detach_nic
+snapshots = false     # snapshot_create, snapshot_list, snapshot_revert, snapshot_delete
+# Existing VMs (must also be in allowed_vms) the enabled operations may act on. "*" = every allowed VM.
+manage_vms = []
+# libvirt storage pool (directory type) where new disks are created. Required for create.
+disk_pool = ""
+# Host directories ISO images may be used from (create_vm, set_cdrom, list_isos).
+iso_dirs = []
+# libvirt networks VMs may be connected to. The first one is the create_vm default.
+networks = []
+max_vms = 2           # VMs created by this server that may exist at once
+max_vcpus = 2         # per VM
+max_memory_mib = 4096 # per VM
+max_disk_gib = 32     # per disk
+
 [limits]
 exec_timeout_secs = 60              # default per-call exec timeout
 max_output_bytes = 1048576          # stdout/stderr cap per exec call

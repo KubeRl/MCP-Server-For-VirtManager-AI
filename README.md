@@ -4,8 +4,9 @@ The commits are the only non-vibecoded part of this project, and also this line.
 
 An MCP server that gives an AI access to libvirt / virt-manager VMs:
 command execution, file access, copying host files into guests, the serial console, screenshots
-and keyboard input. VMs you opt in can also be started and stopped. It cannot create or
-reconfigure VMs.
+and keyboard input. VMs you opt in can also be started and stopped. Creating, deleting and
+reconfiguring VMs and snapshots are available too, but are off until you enable them (see
+[VM management](#vm-management)).
 
 Host: Linux. Guests: Linux and Windows.
 
@@ -17,6 +18,7 @@ Host: Linux. Guests: Linux and Windows.
 | `console_open/read/write/close` | Serial / virtio console stream (`virDomainOpenConsole`, like `virsh console`) | `<console>`/`<serial>` device + getty on it |
 | `screenshot`, `send_keys`, `type_text` | Graphical display (`virDomainScreenshot`, `virDomainSendKey`) | A graphics device (SPICE/VNC) |
 | `start_vm`, `stop_vm` | libvirt (`virDomainCreate`, `virDomainShutdown`, `virDomainDestroy`) | none (graceful stop needs ACPI or the guest agent) |
+| VM management tools | libvirt domain, storage volume and snapshot APIs | none |
 
 `list_dir` and `stat_path` run fixed helper commands through `guest-exec`
 (`stat`/`find` on Linux, PowerShell on Windows), because qemu-ga has no directory listing.
@@ -37,9 +39,14 @@ The path is passed as data, never spliced into shell code.
 | `guest_info`: OS, hostname, NICs, filesystems, users, timezone | ❌ |
 | `screenshot` (PNG, downscaled to 1280 px wide by default) | ❌ |
 | `send_keys` (`ctrl+alt+delete`, `win+r`, …), `type_text` (US layout) | ❌ |
+| `create_vm`, `delete_vm` (only with `manage.create` / `manage.delete`) | ❌ |
+| `configure_vm`, `attach_disk`, `detach_disk`, `set_cdrom`, `attach_nic`, `detach_nic` (only with `manage.reconfigure`) | ❌ |
+| `snapshot_create`, `snapshot_list`, `snapshot_revert`, `snapshot_delete` (only with `manage.snapshots`) | ❌ |
+| `describe_vm` (with any `manage` operation), `list_isos` (with create/reconfigure and `iso_dirs`) | ❌ |
 
 In read-only mode the ❌ tools are not advertised at all. `start_vm`/`stop_vm` are also hidden while
-`power_vms` is empty, and `copy_to_vm` while no host directory is shared (`host_share_dirs` / `share_project_dir`).
+`power_vms` is empty (unless VM management is on), and `copy_to_vm` while no host directory is shared
+(`host_share_dirs` / `share_project_dir`).
 
 ## Build
 
@@ -68,6 +75,56 @@ cargo build --release
    server in the session's project directory, and that directory becomes the only share. It is
    ignored when that directory is `/` or your home directory. In HTTP mode there's one shared
    server, so the "project" is wherever you started it.
+
+## VM management
+
+All of it is off by default. Enable each operation separately in the `[manage]` section of the
+config file (see `config.example.toml`):
+
+```toml
+[manage]
+create = true
+delete = true
+reconfigure = true
+snapshots = true
+manage_vms = []                  # existing VMs (also in allowed_vms) the tools may act on
+disk_pool = "default"            # libvirt pool for new disks, required for create
+iso_dirs = ["/var/lib/libvirt/iso"]
+networks = ["default"]
+max_vms = 2
+max_vcpus = 2
+max_memory_mib = 4096
+max_disk_gib = 32
+```
+
+- **Which VMs:** the management tools act on VMs this server created and on VMs listed in
+  `manage_vms`. A VM created by the server carries a marker in its libvirt metadata. While any
+  `manage` operation is enabled, such VMs are also treated as if they were in `allowed_vms` and
+  `power_vms`, so the AI can start them, use `exec` and so on. Other VMs stay off limits.
+  `list_vms` shows `managed: true` for VMs the tools may act on.
+- **Creating:** `create_vm` takes a name, `os` (`linux`/`windows`), vCPUs, memory, disk size,
+  `firmware` (`uefi`, the default, or `bios`), an optional TPM 2.0, an install ISO, a second
+  "driver" ISO (e.g. `virtio-win.iso` for Windows) and a network. The VM gets a q35 machine,
+  a virtio disk (a new qcow2 volume `<name>.qcow2` in `disk_pool`), a SATA CD-ROM it boots from
+  after the disk, a virtio NIC, the guest agent channel, a serial console, SPICE and spare PCIe
+  ports for hot-plugging. Windows guests also get Hyper-V enlightenments and a local-time clock.
+  The VM is created shut off.
+- **Deleting:** `delete_vm` needs the VM to be shut off. It removes the VM with its snapshots,
+  NVRAM and TPM state, and deletes the VM's disks that are volumes in `disk_pool`. Disks
+  elsewhere and ISOs are never deleted. The same applies to VMs in `manage_vms`.
+- **Reconfiguring:** `configure_vm` changes vCPUs and memory in the persistent configuration
+  (takes effect at the next boot). `attach_disk` creates a new volume in `disk_pool` and attaches
+  it, also while the VM is running. `detach_disk` needs the VM shut off and **deletes** the volume
+  if it is in `disk_pool`. `set_cdrom` inserts or ejects ISOs, `attach_nic`/`detach_nic` add and
+  remove interfaces on allowed networks. `describe_vm` shows targets and MAC addresses.
+- **Limits:** `max_vcpus`, `max_memory_mib` and `max_disk_gib` apply to create and reconfigure.
+  `max_vms` caps how many VMs created by the server exist at once.
+- **Paths:** ISOs must be inside `iso_dirs` (resolved like `host_share_dirs`, symlinks
+  included), and QEMU (user `libvirt-qemu`/`qemu`) must be able to read them. `list_isos` lists the
+  `.iso` files found there.
+- **Snapshots** are libvirt's internal qcow2 snapshots. A running VM's snapshot includes its
+  memory. A *running* UEFI VM cannot be snapshotted on hosts whose OVMF firmware has no qcow2
+  NVRAM variant (Arch, Ubuntu): libvirt refuses, so shut it down first. BIOS VMs work either way.
 
 ## Guest setup
 
@@ -144,6 +201,17 @@ claude mcp add --transport http virtmanager http://127.0.0.1:8765/mcp \
 
 HTTP mode refuses to start without a token. Requests without a matching `Authorization: Bearer` header get `401`.
 
+## Instructions for AI agents
+
+Two templates tell an agent to install and test software in a development VM through this server
+instead of on the host, keep an inventory of what the VM contains, and use snapshots and
+disposable VMs when the management tools are enabled:
+
+- `global-CLAUDE.md` for Claude Code: copy it into `~/.claude/CLAUDE.md`.
+- `global-AGENTS.md` for agents that read `AGENTS.md` (e.g. Codex: `~/.codex/AGENTS.md`).
+
+Adjust the VM name in them to yours. Both use the same inventory directory, so agents share it.
+
 ## Notes and limitations
 
 - `exec` is not interactive: output is returned when the process exits. On timeout the server tries
@@ -158,4 +226,6 @@ HTTP mode refuses to start without a token. Requests without a matching `Authori
 - `stop_vm` without `force` sends a shutdown request and waits (60 s by default). A guest that
   ignores ACPI and has no guest agent will not shut down; use `force: true` to power it off.
 - `type_text` assumes a US keyboard layout in the guest and supports printable ASCII only.
+- Created VMs reference their disks by file path, like virt-manager. Volume-type disks
+  (`<source pool=… volume=…/>`) failed to open under Ubuntu's AppArmor setup.
 - Logs go to stderr; set verbosity with `RUST_LOG` (e.g. `RUST_LOG=debug`).

@@ -27,6 +27,36 @@ pub struct Config {
     pub read_only: bool,
     pub limits: Limits,
     pub http: Http,
+    pub manage: Manage,
+}
+
+/// VM management (create, delete, reconfigure, snapshots). Everything is off by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Manage {
+    /// Allows `create_vm`.
+    pub create: bool,
+    /// Allows `delete_vm`.
+    pub delete: bool,
+    /// Allows changing vCPUs, memory, disks, CD-ROM media and network interfaces.
+    pub reconfigure: bool,
+    /// Allows creating, listing, reverting and deleting snapshots.
+    pub snapshots: bool,
+    /// Existing VMs (also in `allowed_vms`) the enabled operations may act on, in
+    /// addition to the VMs this server created. `"*"` means every allowed VM.
+    pub manage_vms: Vec<String>,
+    /// libvirt storage pool where new disk images are created. Required for `create`.
+    pub disk_pool: String,
+    /// Host directories install / driver ISOs may be used from.
+    pub iso_dirs: Vec<PathBuf>,
+    /// libvirt networks VMs may be connected to.
+    pub networks: Vec<String>,
+    /// Max number of VMs created by this server that may exist at once.
+    pub max_vms: u32,
+    pub max_vcpus: u32,
+    pub max_memory_mib: u64,
+    /// Max size of a single disk.
+    pub max_disk_gib: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,7 +95,34 @@ impl Default for Config {
             read_only: false,
             limits: Limits::default(),
             http: Http::default(),
+            manage: Manage::default(),
         }
+    }
+}
+
+impl Default for Manage {
+    fn default() -> Self {
+        Self {
+            create: false,
+            delete: false,
+            reconfigure: false,
+            snapshots: false,
+            manage_vms: Vec::new(),
+            disk_pool: String::new(),
+            iso_dirs: Vec::new(),
+            networks: Vec::new(),
+            max_vms: 2,
+            max_vcpus: 2,
+            max_memory_mib: 4096,
+            max_disk_gib: 32,
+        }
+    }
+}
+
+impl Manage {
+    /// Whether any management operation is enabled.
+    pub fn enabled(&self) -> bool {
+        self.create || self.delete || self.reconfigure || self.snapshots
     }
 }
 
@@ -120,14 +177,14 @@ impl Config {
         if self.limits.console_buffer_bytes == 0 {
             bail!("limits.console_buffer_bytes must be positive");
         }
-        for dir in &mut self.host_share_dirs {
-            let real = dir
-                .canonicalize()
-                .with_context(|| format!("host_share_dirs: cannot access {}", dir.display()))?;
-            if !real.is_dir() {
-                bail!("host_share_dirs: {} is not a directory", dir.display());
-            }
-            *dir = real;
+        canonicalize_dirs(&mut self.host_share_dirs, "host_share_dirs")?;
+        canonicalize_dirs(&mut self.manage.iso_dirs, "manage.iso_dirs")?;
+        let m = &self.manage;
+        if m.create && m.disk_pool.is_empty() {
+            bail!("manage.create needs manage.disk_pool");
+        }
+        if m.max_vcpus == 0 || m.max_memory_mib == 0 || m.max_disk_gib == 0 {
+            bail!("manage.max_vcpus, max_memory_mib and max_disk_gib must be positive");
         }
         if self.share_project_dir {
             let cwd = std::env::current_dir()?.canonicalize()?;
@@ -148,22 +205,50 @@ impl Config {
         self.is_allowed(vm) && self.power_vms.iter().any(|a| a == "*" || a == vm)
     }
 
+    /// Whether `vm` is listed in `manage.manage_vms` (VMs created by this server are
+    /// recognised separately, from their libvirt metadata).
+    pub fn in_manage_vms(&self, vm: &str) -> bool {
+        self.is_allowed(vm) && self.manage.manage_vms.iter().any(|a| a == "*" || a == vm)
+    }
+
     /// Resolves `path` (symlinks and `..` included) and checks that it is a regular
     /// file inside one of `host_share_dirs`.
     pub fn share_file(&self, path: &str) -> Result<PathBuf> {
-        let p = Path::new(path);
-        if !p.is_absolute() {
-            bail!("host_path must be absolute");
-        }
-        let real = p.canonicalize().with_context(|| format!("cannot access {path}"))?;
-        if !self.host_share_dirs.iter().any(|d| real.starts_with(d)) {
-            bail!("{path} is not inside host_share_dirs");
-        }
-        if !real.is_file() {
-            bail!("{path} is not a regular file");
-        }
-        Ok(real)
+        file_in(&self.host_share_dirs, path, "host_share_dirs")
     }
+
+    /// Like `share_file`, for ISO images in `manage.iso_dirs`.
+    pub fn iso_file(&self, path: &str) -> Result<PathBuf> {
+        file_in(&self.manage.iso_dirs, path, "manage.iso_dirs")
+    }
+}
+
+fn canonicalize_dirs(dirs: &mut [PathBuf], key: &str) -> Result<()> {
+    for dir in dirs {
+        let real = dir
+            .canonicalize()
+            .with_context(|| format!("{key}: cannot access {}", dir.display()))?;
+        if !real.is_dir() {
+            bail!("{key}: {} is not a directory", dir.display());
+        }
+        *dir = real;
+    }
+    Ok(())
+}
+
+fn file_in(dirs: &[PathBuf], path: &str, key: &str) -> Result<PathBuf> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        bail!("{path}: path must be absolute");
+    }
+    let real = p.canonicalize().with_context(|| format!("cannot access {path}"))?;
+    if !dirs.iter().any(|d| real.starts_with(d)) {
+        bail!("{path} is not inside {key}");
+    }
+    if !real.is_file() {
+        bail!("{path} is not a regular file");
+    }
+    Ok(real)
 }
 
 /// Accepts `cwd` as a project directory unless sharing it would expose too much.
@@ -196,6 +281,7 @@ mod tests {
         assert!(config.share_file(&s(&share.join("link.txt"))).is_err());
         assert!(config.share_file(&s(&share.join("sub"))).is_err());
         assert!(config.share_file("sub/ok.txt").is_err());
+        assert!(config.iso_file(&s(&share.join("sub/ok.txt"))).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -9,6 +9,7 @@ use virt::domain::Domain;
 use virt::sys;
 
 use crate::config::Config;
+use crate::manage;
 
 /// Starts libvirt's default event loop on a background thread. Must run before
 /// the connection is opened: the remote driver only delivers stream data
@@ -59,21 +60,33 @@ impl Hypervisor {
         f(&conn)
     }
 
-    /// Looks up a VM by name, enforcing the allow-list.
+    /// Looks up a VM by name, enforcing the allow-list. VMs created by this server
+    /// count as allowed while VM management is enabled.
     pub fn lookup(&self, name: &str) -> Result<Domain> {
-        if !self.config.is_allowed(name) {
+        let listed = self.config.is_allowed(name);
+        if !listed && !self.config.manage.enabled() {
             bail!("VM '{name}' is not in allowed_vms");
         }
-        self.with_conn(|conn| {
-            Domain::lookup_by_name(conn, name).map_err(|e| anyhow!("VM '{name}' not found: {}", e.message()))
-        })
+        let dom = self.with_conn(|conn| {
+            Domain::lookup_by_name(conn, name).map_err(|e| {
+                if listed {
+                    anyhow!("VM '{name}' not found: {}", e.message())
+                } else {
+                    anyhow!("VM '{name}' is not in allowed_vms and was not created by this server")
+                }
+            })
+        })?;
+        if !listed && !manage::is_owned(&dom) {
+            bail!("VM '{name}' is not in allowed_vms and was not created by this server");
+        }
+        Ok(dom)
     }
 
     /// Looks up a VM by name, enforcing the allow-list and that it is running.
     pub fn domain(&self, name: &str) -> Result<Domain> {
         let dom = self.lookup(name)?;
         if !dom.is_active()? {
-            if self.config.can_power(name) {
+            if self.can_power(&dom) {
                 bail!("VM '{name}' is not running (start it with start_vm)");
             }
             bail!("VM '{name}' is not running (this server may not start it)");
@@ -81,23 +94,49 @@ impl Hypervisor {
         Ok(dom)
     }
 
-    /// All VMs (running or not) that are in the allow-list.
+    /// All VMs (running or not) that are in the allow-list or were created by this server.
     pub fn allowed(&self) -> Result<Vec<Domain>> {
+        let manage = self.config.manage.enabled();
         self.with_conn(|conn| {
             let doms = conn.list_all_domains(0)?;
             Ok(doms
                 .into_iter()
-                .filter(|d| d.get_name().is_ok_and(|n| self.config.is_allowed(&n)))
+                .filter(|d| {
+                    d.get_name().is_ok_and(|n| self.config.is_allowed(&n)) || (manage && manage::is_owned(d))
+                })
                 .collect())
         })
     }
 
+    /// Whether the AI may start and stop `dom`: listed in power_vms, or created by this server.
+    pub fn can_power(&self, dom: &Domain) -> bool {
+        let name = dom.get_name().unwrap_or_default();
+        self.config.can_power(&name) || (self.config.manage.enabled() && manage::is_owned(dom))
+    }
+
     /// Looks up a VM the AI may power on/off.
     fn power_domain(&self, name: &str) -> Result<Domain> {
-        if self.config.is_allowed(name) && !self.config.can_power(name) {
+        let dom = self.lookup(name)?;
+        if !self.can_power(&dom) {
             bail!("VM '{name}' is not in power_vms");
         }
-        self.lookup(name)
+        Ok(dom)
+    }
+
+    /// Whether the enabled management operations may act on `dom`: created by this
+    /// server, or listed in manage.manage_vms.
+    pub fn can_manage(&self, dom: &Domain) -> bool {
+        let name = dom.get_name().unwrap_or_default();
+        self.config.manage.enabled() && (self.config.in_manage_vms(&name) || manage::is_owned(dom))
+    }
+
+    /// Looks up a VM the management tools may act on.
+    pub fn manage_domain(&self, name: &str) -> Result<Domain> {
+        let dom = self.lookup(name)?;
+        if !self.can_manage(&dom) {
+            bail!("VM '{name}' was not created by this server and is not in manage.manage_vms");
+        }
+        Ok(dom)
     }
 
     /// Boots, resumes or wakes a VM. Returns a short description of what happened.

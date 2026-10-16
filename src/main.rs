@@ -4,6 +4,7 @@ mod console;
 mod display;
 mod fsops;
 mod hypervisor;
+mod manage;
 mod server;
 
 use std::path::PathBuf;
