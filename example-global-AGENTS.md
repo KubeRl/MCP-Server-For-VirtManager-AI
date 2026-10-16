@@ -68,8 +68,13 @@ otherwise.
 
 Keep a record of what is installed in each VM so later sessions do not re-check or reinstall it.
 
-- **Location:** `~/.claude/vm-inventory/<vm-name>.md`, shared by all projects and with other AI
-  agents (e.g. Claude Code) that use the same VM. Create it if missing.
+- **Location:** `~/.local/share/vm-inventory/<vm-name>.md` (or `$XDG_DATA_HOME/vm-inventory/`
+  if `XDG_DATA_HOME` is set). It is shared by all projects and by every AI agent that uses the same
+  VM (Claude Code, Codex, ...), so do not keep it in an agent's own config directory. Create the
+  directory and file if missing.
+- **Other agents edit the same file.** Re-read it right before you change it, change only the
+  lines you mean to, and keep the plain Markdown format below. Do not add agent-specific markup
+  or notes about which agent made a change.
 - **Read it first** whenever a task may need a tool in the VM. If the tool is listed, use it
   directly; do not run `which`, `--version` or the package manager just to confirm.
 - **Update it right after** installing, upgrading or removing something, and when you find out

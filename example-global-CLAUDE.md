@@ -68,7 +68,9 @@ otherwise.
 
 Keep a record of what is installed in each VM so later sessions do not re-check or reinstall it.
 
-- **Location:** `~/.claude/vm-inventory/<vm-name>.md`, shared by all projects. Create it if missing.
+- **Location:** `~/.local/share/vm-inventory/<vm-name>.md` (or `$XDG_DATA_HOME/vm-inventory/`
+  if `XDG_DATA_HOME` is set), shared by all projects and with other AI agents that use the same
+  VM. Create it if missing.
 - **Read it first** whenever a task may need a tool in the VM. If the tool is listed, use it
   directly; do not run `which`, `--version` or the package manager just to confirm.
 - **Update it right after** installing, upgrading or removing something, and when you find out
